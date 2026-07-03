@@ -177,6 +177,10 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t sleepScreenCoverMode = FIT;
   // Sleep screen cover filter
   uint8_t sleepScreenCoverFilter = NO_FILTER;
+  // Skip the boot splash when waking from deep sleep: the panel keeps showing
+  // the sleep screen until the target activity's first paint (promoted to a
+  // full refresh to clear it). Implied by the QUICK_RESUME sleep screen mode.
+  uint8_t skipSplashOnWake = 0;
   // Status bar settings
   uint8_t statusBarChapterPageCount = 1;
   uint8_t statusBarBookProgressPercentage = 1;

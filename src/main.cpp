@@ -200,7 +200,11 @@ void enterDeepSleep(bool fromTimeout = false) {
       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
       (fromTimeout &&
        SETTINGS.quickResumeSleepScreen == CrossPointSettings::QUICK_RESUME_SLEEP_SCREEN::QUICK_RESUME_AFTER_TIMEOUT);
-  APP_STATE.showBootScreen = !isQuickResumeSleep;
+  const bool skipSplashOnWake = isQuickResumeSleep || SETTINGS.skipSplashOnWake != 0;
+  APP_STATE.showBootScreen = !skipSplashOnWake;
+  // A static sleep screen left on the panel needs a FULL first content paint on
+  // wake; a quick-resume frame matches the content and can take the fast path.
+  APP_STATE.sleepWakeNeedsFullRefresh = skipSplashOnWake && !isQuickResumeSleep;
 
   APP_STATE.saveToFile();
 
@@ -209,7 +213,7 @@ void enterDeepSleep(bool fromTimeout = false) {
   deepSleepInProgress = true;
   activityManager.goToSleep(fromTimeout);
 
-  if (isQuickResumeSleep) {
+  if (skipSplashOnWake) {
     saveSleepFrameBuffer();
   }
 
@@ -374,11 +378,13 @@ void setup() {
       // Splash skipped: the routing block below picks the target activity; the
       // panel keeps showing the pre-reboot popup until that first paint lands.
       break;
-    case BootResume::QuickResume:
-      // One-shot flag: re-arm the splash for the next non-quick-resume boot. Save
+    case BootResume::QuickResume: {
+      // One-shot flags: re-arm the splash for the next non-quick-resume boot. Save
       // before any painting so a hang in the blocking paint path can't strand
       // us in a quick-resume-with-no-frame loop on the next boot.
+      const bool needsFullRefresh = APP_STATE.sleepWakeNeedsFullRefresh;
       APP_STATE.showBootScreen = true;
+      APP_STATE.sleepWakeNeedsFullRefresh = false;
       APP_STATE.saveToFile();
       if (loadSleepFrameBuffer()) {
         const bool useDifferentialRefresh = gpio.deviceIsX3();
@@ -396,10 +402,21 @@ void setup() {
         } else {
           renderer.displayBuffer(HalDisplay::HALF_REFRESH);
         }
+        if (needsFullRefresh) {
+          // The panel holds a static sleep screen: promote the target activity's
+          // first paint to FULL so the sleep image doesn't ghost through.
+          display.promoteNextRefreshToFull();
+        }
       } else {
+        if (needsFullRefresh) {
+          // The panel holds a static sleep screen and seamless begin skipped the
+          // resync: paint the fallback splash with a FULL refresh to clear it.
+          display.promoteNextRefreshToFull();
+        }
         activityManager.goToBoot();  // frame file missing, fall back to the splash
       }
       break;
+    }
     case BootResume::Splash:
       activityManager.goToBoot();
       break;
