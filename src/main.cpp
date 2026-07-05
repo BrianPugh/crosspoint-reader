@@ -490,7 +490,11 @@ void loop() {
 
   renderer.setFadingFix(SETTINGS.fadingFix);
 
-  if (Serial && millis() - lastMemPrint >= 10000) {
+  // NOT gated on `Serial`: HWCDC's operator bool needs host DTR, and
+  // scripts/debugging_monitor.py deliberately opens with dtr=False/rts=False to
+  // avoid resetting the board — so a `Serial &&` gate never opens under it.
+  // Unattached writes are simply dropped, like every other LOG line.
+  if (millis() - lastMemPrint >= 10000) {
     LOG_INF("MEM", "Free: %d bytes, Total: %d bytes, Min Free: %d bytes, MaxAlloc: %d bytes", ESP.getFreeHeap(),
             ESP.getHeapSize(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
     lastMemPrint = millis();
