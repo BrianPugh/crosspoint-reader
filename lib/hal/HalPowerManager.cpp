@@ -203,6 +203,13 @@ bool HalPowerManager::onEinkBusyWaitSlice(const int8_t busyPin, const uint8_t bu
   if (WiFi.getMode() != WIFI_MODE_NULL || gpio.isUsbConnectedCached()) {
     return false;
   }
+  // Sleep entry latches power presses via a GPIO edge ISR, and a light-sleeping
+  // core drops GPIO edges — a press during the sleep-art refresh waits would be
+  // silently lost. Stay awake while the latch is armed (~1 s per sleep entry);
+  // the busy-wait downclock still applies, and the ISR fires fine at 10 MHz.
+  if (gpio.isPowerWakeLatchArmed()) {
+    return false;
+  }
 
   // Mid-debounce: committing needs a second sample, so let the SDK's short poll
   // delay run instead of halting the chip. Same guard lightSleep() gets in loop().
