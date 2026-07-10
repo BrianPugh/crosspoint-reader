@@ -29,15 +29,6 @@ void SleepActivity::onEnter() {
     return renderLastScreenSleepScreen();
   }
 
-  // Show popup with reader orientation only when going to sleep from reader
-  if (APP_STATE.lastSleepFromReader) {
-    ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
-    GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
-    renderer.setOrientation(GfxRenderer::Orientation::Portrait);
-  } else {
-    GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
-  }
-
   switch (SETTINGS.sleepScreen) {
     case (CrossPointSettings::SLEEP_SCREEN_MODE::BLANK):
       return renderBlankSleepScreen();
@@ -53,6 +44,21 @@ void SleepActivity::onEnter() {
       }
     default:
       return renderDefaultSleepScreen();
+  }
+}
+
+void SleepActivity::paintGoingToSleepPopupOnce() const {
+  if (sleepPopupPainted) {
+    return;
+  }
+  sleepPopupPainted = true;
+  // Show popup with reader orientation only when going to sleep from reader
+  if (APP_STATE.lastSleepFromReader) {
+    ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
+    GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
+    renderer.setOrientation(GfxRenderer::Orientation::Portrait);
+  } else {
+    GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
   }
 }
 
@@ -72,6 +78,7 @@ void SleepActivity::renderCustomSleepScreen() const {
       if (dir) dir.close();
       return;
     }
+    paintGoingToSleepPopupOnce();  // cache miss: the full render is slow
     Bitmap bitmap(file, true);
     if (bitmap.parseHeaders() == BmpReaderError::Ok) {
       LOG_DBG("SLP", "Loading: /sleep.bmp");
@@ -145,6 +152,7 @@ void SleepActivity::renderCustomSleepScreen() const {
           dir.close();
           return;
         }
+        paintGoingToSleepPopupOnce();  // cache miss: the full render is slow
         delay(100);
         Bitmap bitmap(randFile, true);
         if (bitmap.parseHeaders() == BmpReaderError::Ok) {
@@ -292,6 +300,10 @@ void SleepActivity::renderCoverSleepScreen() const {
 
   std::string coverBmpPath;
   bool cropped = SETTINGS.sleepScreenCoverMode == CrossPointSettings::SLEEP_SCREEN_COVER_MODE::CROP;
+
+  // Cover generation below can take seconds on a cold cache, so covers keep
+  // the up-front popup (no refresh saving here, unlike cached custom art).
+  paintGoingToSleepPopupOnce();
 
   // Check if the current book is XTC, TXT, or EPUB
   if (FsHelpers::hasXtcExtension(APP_STATE.openEpubPath)) {
