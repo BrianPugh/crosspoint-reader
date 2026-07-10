@@ -206,7 +206,11 @@ void enterDeepSleep(bool fromTimeout = false) {
   // wake; a quick-resume frame matches the content and can take the fast path.
   APP_STATE.sleepWakeNeedsFullRefresh = skipSplashOnWake && !isQuickResumeSleep;
 
-  APP_STATE.saveToFile();
+  if (!APP_STATE.saveToFile()) {
+    // Wake reads these flags from SD; if this write failed the next wake
+    // falls back to the splash (one-shot arm design, self-heals next sleep).
+    LOG_ERR("MAIN", "Failed to persist sleep state; next wake will show the splash");
+  }
 
   // Commit to sleeping before goToSleep() runs the outgoing activity's onExit():
   // a WiFi activity would otherwise silentRestart() here and reboot instead.
@@ -373,6 +377,13 @@ void setup() {
   const BootResume resume = isSilentReboot              ? BootResume::Silent
                             : !APP_STATE.showBootScreen ? BootResume::QuickResume
                                                         : BootResume::Splash;
+  // Splash on a perceived wake is always one of these inputs: showBootScreen=1
+  // means the previous session never completed enterDeepSleep() (flash, plain
+  // reboot, panic, brownout, or the sleep-time state write failed).
+  LOG_DBG("MAIN", "Boot resume=%d (reset=%d wake=%d showBootScreen=%d needsFull=%d silent=%d)",
+          static_cast<int>(resume), static_cast<int>(esp_reset_reason()), static_cast<int>(wakeupReason),
+          static_cast<int>(APP_STATE.showBootScreen), static_cast<int>(APP_STATE.sleepWakeNeedsFullRefresh),
+          static_cast<int>(isSilentReboot));
   bool allowFastInitialReaderRefresh = false;
 
   setupDisplayAndFonts(resume != BootResume::Splash);
