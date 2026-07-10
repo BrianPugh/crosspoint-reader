@@ -1116,6 +1116,10 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 
   const ReaderRenderSpec renderSpec = SETTINGS.readerRenderSpec(viewportWidth, viewportHeight);
 
+#if BOOT_PROFILE
+  const unsigned long sectionLoadStart = millis();
+  const bool sectionNeedsLoad = (section == nullptr);
+#endif
   if (!section) {
     const auto filepath = epub->getSpineItem(currentSpineIndex).href;
     LOG_DBG("ERS", "Loading file: %s, index: %d", filepath.c_str(), currentSpineIndex);
@@ -1301,6 +1305,13 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       pendingPercentJump = false;
     }
   }
+#if BOOT_PROFILE
+  if (sectionNeedsLoad) {
+    // Splits the render total: this is the SD deserialize (or full build) of
+    // the section; the remainder to "render took" is page draw + e-ink refresh.
+    LOG_INF("BOOT", "section load took %lu ms", millis() - sectionLoadStart);
+  }
+#endif
 
   // Extend the build to the requested page if needed (for partials and in-progress builds).
   // This runs every render, so it covers both the first page and any forward turn that gets
