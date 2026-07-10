@@ -213,7 +213,11 @@ void enterDeepSleep(bool fromTimeout = false) {
   deepSleepInProgress = true;
   activityManager.goToSleep(fromTimeout);
 
-  if (skipSplashOnWake) {
+  // Only quick-resume sleeps save the frame: the wake path restores it for the
+  // cheap overlay + HALF resume. Static-art skip-splash wakes never read it
+  // (their first content paint is promoted to FULL, which doesn't diff against
+  // the old frame), so skip the 48 KB SD write.
+  if (isQuickResumeSleep) {
     saveSleepFrameBuffer();
   }
 
@@ -386,7 +390,20 @@ void setup() {
       APP_STATE.showBootScreen = true;
       APP_STATE.sleepWakeNeedsFullRefresh = false;
       APP_STATE.saveToFile();
-      if (loadSleepFrameBuffer()) {
+      if (needsFullRefresh) {
+        // The panel retains a static sleep screen that doesn't match the target
+        // content, so the first content paint must be FULL regardless. Pay zero
+        // refreshes here: no frame restore (a FULL paint never diffs against the
+        // old frame) and no loading-icon overlay — the panel is powered off
+        // after deep sleep, and the X3 driver promotes any first post-sleep
+        // refresh to the full waveform chain, so an icon swap costs ~2.4 s
+        // (measured 2026-07-09), more than the splash it replaces. The retained
+        // art itself is the wake feedback until the content lands in one chain.
+        Storage.remove(SLEEP_FRAME_FILE);  // not saved on this path; clear any stale file
+        display.promoteNextRefreshToFull();
+      } else if (loadSleepFrameBuffer()) {
+        // True quick resume: the retained frame matches the target content, so
+        // a cheap overlay + differential refresh gives immediate feedback.
         const bool useDifferentialRefresh = gpio.deviceIsX3();
         if (useDifferentialRefresh) {
           // begin() clears the X3 controller RAM, so restore the saved frame as
@@ -402,17 +419,7 @@ void setup() {
         } else {
           renderer.displayBuffer(HalDisplay::HALF_REFRESH);
         }
-        if (needsFullRefresh) {
-          // The panel holds a static sleep screen: promote the target activity's
-          // first paint to FULL so the sleep image doesn't ghost through.
-          display.promoteNextRefreshToFull();
-        }
       } else {
-        if (needsFullRefresh) {
-          // The panel holds a static sleep screen and seamless begin skipped the
-          // resync: paint the fallback splash with a FULL refresh to clear it.
-          display.promoteNextRefreshToFull();
-        }
         activityManager.goToBoot();  // frame file missing, fall back to the splash
       }
       break;
