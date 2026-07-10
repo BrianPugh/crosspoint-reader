@@ -552,6 +552,10 @@ void loop() {
     if (gpio.isPressed(HalGPIO::BTN_DOWN)) {
       return;
     }
+    // The only user-visible acknowledgment can be seconds away (a wake paint in
+    // flight must finish before the sleep screen renders), so log the trigger
+    // itself for field diagnosis of "my sleep press was ignored" reports.
+    LOG_INF("MAIN", "Power hold-to-sleep triggered (held %lu ms)", gpio.getPowerButtonHeldTime());
     enterDeepSleep();
     // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
     return;
