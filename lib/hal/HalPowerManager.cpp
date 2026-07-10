@@ -4,6 +4,7 @@
 #include <Logging.h>
 #include <PowerManager.h>
 #include <WiFi.h>
+#include <driver/gpio.h>
 #include <esp_sleep.h>
 #include <soc/soc_caps.h>
 
@@ -12,6 +13,10 @@
 #include "HalGPIO.h"
 
 HalPowerManager powerManager;  // Singleton instance
+
+// GPIO13 is the flash SPIWP pad (unused in this board's DIO flash mode), rewired to the
+// battery-latch MOSFET gate: high keeps the battery connected, low powers the device off.
+static constexpr gpio_num_t GPIO_BATTERY_LATCH = GPIO_NUM_13;
 
 void HalPowerManager::begin() {
   if (BoardConfig::ACTIVE.batteryAdc >= 0) {

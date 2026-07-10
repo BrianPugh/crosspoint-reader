@@ -268,6 +268,11 @@ void setupDisplayAndFonts(bool seamless = false) {
 }
 
 void setup() {
+  // First statement on purpose: a wake during the post-poweroff capacitor-decay
+  // window boots with the battery latch still pad-held LOW — every instruction
+  // before this line runs on borrowed power that dies when the user releases
+  // the button. holdPowerRails() releases the stale hold and re-asserts the
+  // profile's latch pins (GPIO13 on X3/X4).
   BoardConfig::holdPowerRails();
 
   t1 = millis();
