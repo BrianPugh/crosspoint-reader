@@ -195,6 +195,10 @@ static bool loadSleepFrameBuffer() {
 // Enter deep sleep mode
 void enterDeepSleep(bool fromTimeout = false) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
+  // Sleep-entry timing: the power button is dead from here until
+  // startDeepSleep() releases the battery latch (nothing polls it in between),
+  // so these marks measure the user-perceived "can't wake yet" window.
+  BOOT_MARK("sleep: enter");
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
 
   const bool isQuickResumeSleep =
@@ -204,14 +208,17 @@ void enterDeepSleep(bool fromTimeout = false) {
   APP_STATE.showBootScreen = !isQuickResumeSleep;
 
   APP_STATE.saveToFile();
+  BOOT_MARK("sleep: state saved");
 
   // Commit to sleeping before goToSleep() runs the outgoing activity's onExit():
   // a WiFi activity would otherwise silentRestart() here and reboot instead.
   deepSleepInProgress = true;
   activityManager.goToSleep(fromTimeout);
+  BOOT_MARK("sleep: sleep screen done (activity exit + art pipeline)");
 
   if (isQuickResumeSleep) {
     saveSleepFrameBuffer();
+    BOOT_MARK("sleep: frame buffer saved (48 KB)");
   }
 
   // Tear down WiFi so the modem power domain isn't held alive across deep sleep.
@@ -223,7 +230,14 @@ void enterDeepSleep(bool fromTimeout = false) {
 
   halTiltSensor.deepSleep();
   display.deepSleep();
+  BOOT_MARK("sleep: peripherals down, releasing battery latch");
   LOG_DBG("MAIN", "Entering deep sleep");
+#if BOOT_PROFILE
+  // Serial output emitted <500 ms before the latch releases is lost before the
+  // host drains it (see docs/boot-sleep-optimization.md methodology); hold the
+  // port open long enough to capture the marks above. Profiling builds only.
+  delay(500);
+#endif
 
   powerManager.startDeepSleep(gpio);
 }

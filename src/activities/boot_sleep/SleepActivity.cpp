@@ -9,6 +9,7 @@
 #include <Txt.h>
 #include <Xtc.h>
 
+#include "BootProfiler.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "activities/reader/ReaderUtils.h"
@@ -37,6 +38,7 @@ void SleepActivity::onEnter() {
   } else {
     GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
   }
+  BOOT_MARK("sleep art: 'going to sleep' popup painted");
 
   switch (SETTINGS.sleepScreen) {
     case (CrossPointSettings::SLEEP_SCREEN_MODE::BLANK):
@@ -117,6 +119,9 @@ void SleepActivity::renderCustomSleepScreen() const {
       dirFile.close();
     }
     const auto numFiles = files.size();
+    // Scan cost scales with the file count: every candidate BMP's headers are
+    // parsed from SD on every sleep.
+    BOOT_MARK("sleep art: /sleep dir scanned");
     if (numFiles > 0) {
       // Pick a random wallpaper, excluding recently shown ones.
       // Window: up to SLEEP_RECENT_COUNT entries, capped at numFiles-1.
@@ -218,6 +223,7 @@ void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap) const {
                             SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::NO_FILTER;
 
   renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, cropX, cropY);
+  BOOT_MARK("sleep art: BW plane drawn (SD stream + scale)");
 
   if (SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::INVERTED_BLACK_AND_WHITE) {
     renderer.invertScreen();
@@ -232,21 +238,27 @@ void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap) const {
   } else {
     renderer.displayBuffer(HalDisplay::HALF_REFRESH);
   }
+  BOOT_MARK("sleep art: base refresh done");
 
   if (hasGreyscale) {
     bitmap.rewindToData();
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
     renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, cropX, cropY);
+    BOOT_MARK("sleep art: gray LSB plane drawn (SD stream + scale)");
     renderer.copyGrayscaleLsbBuffers();
+    BOOT_MARK("sleep art: gray LSB copied to controller");
 
     bitmap.rewindToData();
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
     renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, cropX, cropY);
+    BOOT_MARK("sleep art: gray MSB plane drawn (SD stream + scale)");
     renderer.copyGrayscaleMsbBuffers();
+    BOOT_MARK("sleep art: gray MSB copied to controller");
 
     renderer.displayGrayBuffer();
+    BOOT_MARK("sleep art: gray nudge refresh done");
     renderer.setRenderMode(GfxRenderer::BW);
   }
 }
