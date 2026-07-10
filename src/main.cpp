@@ -162,9 +162,18 @@ void silentRestartToReader() {
 
 void waitForPowerRelease() {
   gpio.update();
+  const unsigned long start = millis();
+  unsigned long lastLog = start;
   while (gpio.isPressed(HalGPIO::BTN_POWER)) {
     delay(50);
     gpio.update();
+    // A stuck-pressed misread here parks the boot at the retained lockscreen
+    // forever with the device fully awake; make that state field-diagnosable.
+    if (millis() - lastLog >= 1000) {
+      lastLog = millis();
+      LOG_DBG("MAIN", "Still waiting for power release at boot (%lu ms, held=%lu ms)", millis() - start,
+              gpio.getPowerButtonHeldTime());
+    }
   }
 }
 
