@@ -539,6 +539,13 @@ void loop() {
   {
     static bool powerWasDown = true;  // true at boot: a press already down at the first loop never arms
     const bool powerDown = gpio.isPressed(HalGPIO::BTN_POWER);
+    if (powerDown != powerWasDown) {
+      // Field-diagnosable trace of every committed power transition the loop
+      // observes: a physical press with no matching "down" line means the
+      // debounce/sampling path swallowed it before the sleep logic ever saw it.
+      LOG_DBG("PWR", "Power btn %s (held=%lums armed=%d)", powerDown ? "down" : "up", gpio.getPowerButtonHeldTime(),
+              powerSleepArmed ? 1 : 0);
+    }
     if (powerDown && !powerWasDown) {
       powerSleepArmed = true;
     } else if (!powerDown) {
