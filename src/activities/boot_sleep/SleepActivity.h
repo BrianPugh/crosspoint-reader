@@ -1,4 +1,5 @@
 #pragma once
+#include "SleepArtCache.h"
 #include "activities/Activity.h"
 
 class Bitmap;
@@ -13,7 +14,8 @@ class SleepActivity final : public Activity {
   void renderDefaultSleepScreen() const;
   void renderCustomSleepScreen() const;
   void renderCoverSleepScreen() const;
-  void renderBitmapSleepScreen(const Bitmap& bitmap) const;
+  // cacheKey non-null persists the rendered planes for later cache-hit sleeps.
+  void renderBitmapSleepScreen(const Bitmap& bitmap, const SleepArtCache::Key* cacheKey = nullptr) const;
   void renderLastScreenSleepScreen() const;
   void renderBlankSleepScreen() const;
 
