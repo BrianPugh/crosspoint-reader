@@ -97,6 +97,15 @@ class HalGPIO {
 
   WakeupReason getWakeupReason() const;
 
+  // Latch power-button presses while nothing polls input (sleep entry, up to
+  // several seconds with uncached sleep art). ISR-based on the power GPIO: a
+  // press counts only after >=30 ms of contact, which filters both the release
+  // bounce of the gesture that started the sleep and electrical noise.
+  // armPowerWakeLatch() attaches the ISR and clears the latch;
+  // consumePowerWakeLatch() detaches it and reports whether a press landed.
+  void armPowerWakeLatch();
+  bool consumePowerWakeLatch();
+
   // Button indices
   static constexpr uint8_t BTN_BACK = 0;
   static constexpr uint8_t BTN_CONFIRM = 1;

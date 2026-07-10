@@ -194,6 +194,10 @@ static bool loadSleepFrameBuffer() {
 // Enter deep sleep mode
 void enterDeepSleep(bool fromTimeout = false) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
+  // Nothing polls input from here until the power actually cuts (up to several
+  // seconds with uncached sleep art), so latch power presses via ISR — a
+  // swallowed press means the user waits out the entry, then has to press again.
+  gpio.armPowerWakeLatch();
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
 
   const bool isQuickResumeSleep =
@@ -222,6 +226,16 @@ void enterDeepSleep(bool fromTimeout = false) {
 
   halTiltSensor.deepSleep();
   display.deepSleep();
+
+  if (gpio.consumePowerWakeLatch()) {
+    // The user pressed power mid-entry: they want the device back, so reboot
+    // into the normal wake path instead of powering off. State was already
+    // saved for wake above; the panel wakes from deep sleep like a real wake.
+    LOG_INF("MAIN", "Power press during sleep entry; waking instead of sleeping");
+    delay(50);  // let the log line flush
+    ESP.restart();
+  }
+
   LOG_DBG("MAIN", "Entering deep sleep");
 
   powerManager.startDeepSleep(gpio);
