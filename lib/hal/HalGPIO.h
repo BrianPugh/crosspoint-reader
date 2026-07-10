@@ -103,8 +103,12 @@ class HalGPIO {
   // bounce of the gesture that started the sleep and electrical noise.
   // armPowerWakeLatch() attaches the ISR and clears the latch;
   // consumePowerWakeLatch() detaches it and reports whether a press landed.
+  // isPowerWakeLatchArmed() is true between the two — any light-sleep path
+  // must check it and stay awake: a light-sleeping core drops the GPIO edge
+  // interrupts the latch depends on.
   void armPowerWakeLatch();
   bool consumePowerWakeLatch();
+  bool isPowerWakeLatchArmed() const;
 
   // Button indices
   static constexpr uint8_t BTN_BACK = 0;

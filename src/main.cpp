@@ -227,17 +227,10 @@ void enterDeepSleep(bool fromTimeout = false) {
   halTiltSensor.deepSleep();
   display.deepSleep();
 
-  if (gpio.consumePowerWakeLatch()) {
-    // The user pressed power mid-entry: they want the device back, so reboot
-    // into the normal wake path instead of powering off. State was already
-    // saved for wake above; the panel wakes from deep sleep like a real wake.
-    LOG_INF("MAIN", "Power press during sleep entry; waking instead of sleeping");
-    delay(50);  // let the log line flush
-    ESP.restart();
-  }
-
   LOG_DBG("MAIN", "Entering deep sleep");
 
+  // startDeepSleep() consumes the wake latch after its button-release wait, so
+  // a press landing anywhere up to that point reboots into the wake path.
   powerManager.startDeepSleep(gpio);
 }
 

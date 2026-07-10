@@ -285,6 +285,8 @@ bool HalGPIO::consumePowerWakeLatch() {
   return pressed;
 }
 
+bool HalGPIO::isPowerWakeLatchArmed() const { return powerLatchPin >= 0; }
+
 bool HalGPIO::isUsbConnected() const {
   if (deviceIsX3()) {
     // X3: infer USB/charging via BQ27220 Current() register (0x0C, signed mA).
