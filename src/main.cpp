@@ -41,7 +41,6 @@ ActivityManager activityManager(renderer, mappedInputManager);
 FontDecompressor fontDecompressor;
 SdCardFontSystem sdFontSystem;
 FontCacheManager fontCacheManager(renderer.getFontMap(), renderer.getSdCardFonts());
-static unsigned long allowSleepAt = 0;
 
 // Fonts
 EpdFont notoserif14RegularFont(&notoserif_14_regular);
@@ -453,7 +452,6 @@ void setup() {
 
   // Ensure we're not still holding the power button before leaving setup
   waitForPowerRelease();
-  allowSleepAt = millis() + 2000;
 }
 
 void loop() {
@@ -530,8 +528,26 @@ void loop() {
     return;
   }
 
-  if (millis() >= allowSleepAt && gpio.isPressed(HalGPIO::BTN_POWER) &&
-      gpio.getPowerButtonHeldTime() > SETTINGS.getPowerButtonDuration()) {
+  // Hold-to-sleep arms only on a released->pressed transition observed by this
+  // loop, never on the button's level alone: the wake gesture is released
+  // before loop() starts (setup blocks in waitForPowerRelease), so any level
+  // still present at the first iteration is stale, and a fresh press is
+  // user intent even while the wake paint is still rendering. Level-tracked
+  // here rather than via gpio.wasPressed() so an activity calling
+  // mappedInput.update() in an inner loop can't consume the edge event.
+  static bool powerSleepArmed = false;
+  {
+    static bool powerWasDown = true;  // true at boot: a press already down at the first loop never arms
+    const bool powerDown = gpio.isPressed(HalGPIO::BTN_POWER);
+    if (powerDown && !powerWasDown) {
+      powerSleepArmed = true;
+    } else if (!powerDown) {
+      powerSleepArmed = false;
+    }
+    powerWasDown = powerDown;
+  }
+
+  if (powerSleepArmed && gpio.getPowerButtonHeldTime() > SETTINGS.getPowerButtonDuration()) {
     // If the screenshot combination is potentially being pressed, don't sleep
     if (gpio.isPressed(HalGPIO::BTN_DOWN)) {
       return;
