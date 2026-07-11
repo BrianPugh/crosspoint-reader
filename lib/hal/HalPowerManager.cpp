@@ -14,6 +14,27 @@
 
 HalPowerManager powerManager;  // Singleton instance
 
+// Light-sleep path switches (documented bisect knobs; all default ON).
+// 2026-07-10 wedge postmortem: an intermittent on-battery freeze was first
+// attributed to the BUSY-slice light sleep and these knobs drove the bisect.
+// The real culprit was the power-wake latch leaving the GPIO ISR service
+// permanently installed (Arduino attachInterrupt) × the slices' level-type
+// wake interrupts — fixed by the raw-IDF ISR lifecycle in HalGPIO
+// (armPowerWakeLatch/consumePowerWakeLatch) plus the explicit intr-type
+// clears after each slice below. The slice sleep itself was exonerated (a
+// control build with the latch compiled out could not be wedged). Knobs kept
+// as documented switches for future bisects and the wedge* test envs in
+// gitignored platformio.local.ini.
+#ifndef POWER_BTN_LIGHT_SLEEP_WAKE
+#define POWER_BTN_LIGHT_SLEEP_WAKE 1
+#endif
+#ifndef BUSY_SLICE_LIGHT_SLEEP
+#define BUSY_SLICE_LIGHT_SLEEP 1
+#endif
+#ifndef IDLE_LIGHT_SLEEP
+#define IDLE_LIGHT_SLEEP 1
+#endif
+
 // GPIO13 is the flash SPIWP pad (unused in this board's DIO flash mode), rewired to the
 // battery-latch MOSFET gate: high keeps the battery connected, low powers the device off.
 static constexpr gpio_num_t GPIO_BATTERY_LATCH = GPIO_NUM_13;
@@ -121,6 +142,9 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
 }
 
 bool HalPowerManager::lightSleep(const HalGPIO& gpio) const {
+#if !IDLE_LIGHT_SLEEP
+  return false;  // bisect knob (see top of file)
+#endif
   // A performance Lock means a render (or similar) task is mid-flight; light sleep
   // freezes the whole chip, so it would stall that task.
   // Note: like setPowerSaving(), read without the mutex — stale in either
@@ -153,7 +177,11 @@ bool HalPowerManager::lightSleep(const HalGPIO& gpio) const {
   // blip, never a phantom press. Idle cost is zero — the pin only holds its
   // pressed level while a finger is on it.
   esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(LIGHT_SLEEP_SLICE_MS) * 1000ULL);
+#if POWER_BTN_LIGHT_SLEEP_WAKE
   const int8_t powerPin = BoardConfig::ACTIVE.input.power;
+#else
+  const int8_t powerPin = -1;  // bisect knob (see top of file)
+#endif
   if (powerPin >= 0) {
     gpio_wakeup_enable(static_cast<gpio_num_t>(powerPin),
                        BoardConfig::ACTIVE.input.powerActiveHigh ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL);
@@ -198,6 +226,9 @@ bool HalPowerManager::lightSleep(const HalGPIO& gpio) const {
 }
 
 bool HalPowerManager::onEinkBusyWaitSlice(const int8_t busyPin, const uint8_t busyLevel) {
+#if !BUSY_SLICE_LIGHT_SLEEP
+  return false;  // bisect knob (see top of file)
+#endif
   // Same exclusions as lightSleep(): light sleep drops a WiFi association and
   // kills an enumerated USB-CDC link. No LOG here — this runs ~50x/s mid-refresh.
   if (WiFi.getMode() != WIFI_MODE_NULL || gpio.isUsbConnectedCached()) {
@@ -229,7 +260,11 @@ bool HalPowerManager::onEinkBusyWaitSlice(const int8_t busyPin, const uint8_t bu
   // Also wake the instant the power button is pressed, so the main loop's poll
   // sees even sub-slice taps mid-refresh (same rationale and safety argument
   // as lightSleep(): the wake is an early poll, never a synthesized press).
+#if POWER_BTN_LIGHT_SLEEP_WAKE
   const int8_t powerPin = BoardConfig::ACTIVE.input.power;
+#else
+  const int8_t powerPin = -1;  // bisect knob (see top of file)
+#endif
   if (powerPin >= 0) {
     gpio_wakeup_enable(static_cast<gpio_num_t>(powerPin),
                        BoardConfig::ACTIVE.input.powerActiveHigh ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL);
