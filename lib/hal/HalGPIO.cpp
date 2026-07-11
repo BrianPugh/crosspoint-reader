@@ -234,6 +234,15 @@ bool HalGPIO::verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPre
   return true;
 }
 
+// Compile-time kill switch for the power-wake latch. A control build with
+// -DPOWER_WAKE_LATCH=0 never installs the GPIO ISR service at all — the
+// attribution experiment for the slice-sleep wedge (see
+// docs/slice-wedge-findings.md, candidate #1). Costs boot-cancel and the
+// sleep-entry wake latch; never ship with 0.
+#ifndef POWER_WAKE_LATCH
+#define POWER_WAKE_LATCH 1
+#endif
+
 namespace {
 // Power-wake latch state. Written by the ISR, read by the task after
 // detaching; single 32-bit-aligned loads/stores are atomic on this core.
@@ -245,7 +254,7 @@ bool powerLatchActiveHigh = false;
 
 constexpr uint32_t POWER_LATCH_MIN_CONTACT_MS = 30;
 
-void IRAM_ATTR powerWakeLatchIsr() {
+void IRAM_ATTR powerWakeLatchIsr(void*) {
   const bool pressed = (gpio_get_level(static_cast<gpio_num_t>(powerLatchPin)) != 0) == powerLatchActiveHigh;
   const uint32_t now = millis();
   if (pressed) {
@@ -265,6 +274,9 @@ void IRAM_ATTR powerWakeLatchIsr() {
 }  // namespace
 
 void HalGPIO::armPowerWakeLatch() {
+#if !POWER_WAKE_LATCH
+  return;  // wedge-attribution control build: no latch, no GPIO ISR service
+#endif
   powerLatchPin = BoardConfig::ACTIVE.input.power;
   powerLatchActiveHigh = BoardConfig::ACTIVE.input.powerActiveHigh;
   if (powerLatchPin < 0) {
@@ -272,14 +284,39 @@ void HalGPIO::armPowerWakeLatch() {
   }
   powerLatchPressMs = 0;
   powerLatchLongestContactMs = 0;
-  attachInterrupt(digitalPinToInterrupt(powerLatchPin), powerWakeLatchIsr, CHANGE);
+  // Raw IDF ISR lifecycle, NOT Arduino attachInterrupt(): consume uninstalls
+  // the GPIO ISR service (its CPU interrupt must not exist outside the latch
+  // windows — an asserted level-type wake interrupt feeding the shared
+  // service with no per-pin handler re-enters forever; the slice-sleep wedge,
+  // docs/slice-wedge-findings.md #1). Arduino cannot survive that uninstall:
+  // its core tracks the install in a never-reset function-local static
+  // (esp32-hal-gpio.c, interrupt_initialized), so a later attachInterrupt()
+  // would skip the reinstall and this ISR would silently never fire again.
+  // Flag 0 = same service config Arduino used here before. A press edge
+  // landing while flash cache is suspended (SPIFFS/NVS write) is held in the
+  // GPIO status register and serviced late, not lost.
+  const auto pin = static_cast<gpio_num_t>(powerLatchPin);
+  const esp_err_t err = gpio_install_isr_service(0);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    LOG_ERR("GPIO", "Wake latch ISR service install failed: %d", static_cast<int>(err));
+    powerLatchPin = -1;
+    return;
+  }
+  gpio_set_intr_type(pin, GPIO_INTR_ANYEDGE);
+  gpio_isr_handler_add(pin, powerWakeLatchIsr, nullptr);
 }
 
 uint32_t HalGPIO::consumePowerWakeLatch() {
   if (powerLatchPin < 0) {
     return 0;
   }
-  detachInterrupt(digitalPinToInterrupt(powerLatchPin));
+  const auto pin = static_cast<gpio_num_t>(powerLatchPin);
+  gpio_isr_handler_remove(pin);
+  gpio_set_intr_type(pin, GPIO_INTR_DISABLE);
+  // Free the service's CPU interrupt entirely (safe: this latch is the only
+  // ISR-service user in the tree). The slice hook declines while the latch is
+  // armed, so the service and the light-sleep level wakes never coexist.
+  gpio_uninstall_isr_service();
   uint32_t longestContactMs = powerLatchLongestContactMs;
   // Also count a press that is still held right now (pressed edge latched,
   // no release yet, contact time already past the bounce floor).
