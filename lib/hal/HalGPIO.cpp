@@ -238,8 +238,8 @@ namespace {
 // Power-wake latch state. Written by the ISR, read by the task after
 // detaching; single 32-bit-aligned loads/stores are atomic on this core.
 // Non-const statics live in DRAM, as IRAM_ATTR code requires.
-volatile uint32_t powerLatchPressMs = 0;  // millis() of the last pressed edge
-volatile bool powerLatchValidPress = false;
+volatile uint32_t powerLatchPressMs = 0;           // millis() of the last pressed edge
+volatile uint32_t powerLatchLongestContactMs = 0;  // longest completed press since arming
 int8_t powerLatchPin = -1;
 bool powerLatchActiveHigh = false;
 
@@ -250,12 +250,16 @@ void IRAM_ATTR powerWakeLatchIsr() {
   const uint32_t now = millis();
   if (pressed) {
     powerLatchPressMs = now;
-  } else if (powerLatchPressMs != 0 && now - powerLatchPressMs >= POWER_LATCH_MIN_CONTACT_MS) {
-    // A full press->release with real contact time. Requiring the pressed
-    // edge to have been seen by THIS ISR ignores the release of the gesture
-    // that initiated the sleep (its pressed edge predates the arm), and the
-    // contact-time floor ignores its release bounce.
-    powerLatchValidPress = true;
+  } else if (powerLatchPressMs != 0) {
+    // A full press->release. Requiring the pressed edge to have been seen by
+    // THIS ISR ignores the release of the gesture that opened the latch window
+    // (its pressed edge predates the arm), and the contact-time floor ignores
+    // its release bounce. The longest contact is kept (not the last) so a
+    // qualifying hold isn't shadowed by trailing bounce blips.
+    const uint32_t contact = now - powerLatchPressMs;
+    if (contact >= POWER_LATCH_MIN_CONTACT_MS && contact > powerLatchLongestContactMs) {
+      powerLatchLongestContactMs = contact;
+    }
   }
 }
 }  // namespace
@@ -267,22 +271,26 @@ void HalGPIO::armPowerWakeLatch() {
     return;
   }
   powerLatchPressMs = 0;
-  powerLatchValidPress = false;
+  powerLatchLongestContactMs = 0;
   attachInterrupt(digitalPinToInterrupt(powerLatchPin), powerWakeLatchIsr, CHANGE);
 }
 
-bool HalGPIO::consumePowerWakeLatch() {
+uint32_t HalGPIO::consumePowerWakeLatch() {
   if (powerLatchPin < 0) {
-    return false;
+    return 0;
   }
   detachInterrupt(digitalPinToInterrupt(powerLatchPin));
+  uint32_t longestContactMs = powerLatchLongestContactMs;
   // Also count a press that is still held right now (pressed edge latched,
   // no release yet, contact time already past the bounce floor).
-  const bool heldNow = powerLatchPressMs != 0 && millis() - powerLatchPressMs >= POWER_LATCH_MIN_CONTACT_MS &&
-                       (gpio_get_level(static_cast<gpio_num_t>(powerLatchPin)) != 0) == powerLatchActiveHigh;
-  const bool pressed = powerLatchValidPress || heldNow;
+  if (powerLatchPressMs != 0 && (gpio_get_level(static_cast<gpio_num_t>(powerLatchPin)) != 0) == powerLatchActiveHigh) {
+    const uint32_t contact = millis() - powerLatchPressMs;
+    if (contact >= POWER_LATCH_MIN_CONTACT_MS && contact > longestContactMs) {
+      longestContactMs = contact;
+    }
+  }
   powerLatchPin = -1;
-  return pressed;
+  return longestContactMs;
 }
 
 bool HalGPIO::isPowerWakeLatchArmed() const { return powerLatchPin >= 0; }

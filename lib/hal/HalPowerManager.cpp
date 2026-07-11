@@ -67,7 +67,7 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
   // so there is no post-wait point left to consume the latch at. A press that
   // starts after this check is instead handled by that SDK wait — it holds off
   // sleep until the button is released, then arms it as the wake source.
-  if (gpio.consumePowerWakeLatch()) {
+  if (gpio.consumePowerWakeLatch() != 0) {
     LOG_INF("PWR", "Power press during sleep entry; waking instead of sleeping");
     delay(50);  // let the log line flush
     ESP.restart();
