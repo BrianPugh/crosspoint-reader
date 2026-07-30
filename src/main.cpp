@@ -42,7 +42,6 @@ ActivityManager activityManager(renderer, mappedInputManager);
 FontDecompressor fontDecompressor;
 SdCardFontSystem sdFontSystem;
 FontCacheManager fontCacheManager(renderer.getFontMap(), renderer.getSdCardFonts());
-static unsigned long allowSleepAt = 0;
 
 // Fonts
 EpdFont notoserif14RegularFont(&notoserif_14_regular);
@@ -576,7 +575,6 @@ void setup() {
   // User-dependent: setup() blocks here until the power button is released,
   // which delays the reader's onEnter/first paint (they run in loop()).
   BOOT_MARK("power button released, setup done");
-  allowSleepAt = millis() + 2000;
 }
 
 // delay() counts ticks, and the tick stops while onEinkBusyWaitSlice() light-sleeps
@@ -686,12 +684,41 @@ void loop() {
     return;
   }
 
-  if (millis() >= allowSleepAt && gpio.isPressed(HalGPIO::BTN_POWER) &&
-      gpio.getPowerButtonHeldTime() > SETTINGS.getPowerButtonDuration()) {
+  // Hold-to-sleep arms only on a released->pressed transition observed by this
+  // loop, never on the button's level alone: the wake gesture is released
+  // before loop() starts (setup blocks in waitForPowerRelease), so any level
+  // still present at the first iteration is stale, and a fresh press is
+  // user intent even while the wake paint is still rendering. Level-tracked
+  // here rather than via gpio.wasPressed() so an activity calling
+  // mappedInput.update() in an inner loop can't consume the edge event.
+  static bool powerSleepArmed = false;
+  {
+    static bool powerWasDown = true;  // true at boot: a press already down at the first loop never arms
+    const bool powerDown = gpio.isPressed(HalGPIO::BTN_POWER);
+    if (powerDown != powerWasDown) {
+      // Field-diagnosable trace of every committed power transition the loop
+      // observes: a physical press with no matching "down" line means the
+      // debounce/sampling path swallowed it before the sleep logic ever saw it.
+      LOG_DBG("PWR", "Power btn %s (held=%lums armed=%d)", powerDown ? "down" : "up", gpio.getPowerButtonHeldTime(),
+              powerSleepArmed ? 1 : 0);
+    }
+    if (powerDown && !powerWasDown) {
+      powerSleepArmed = true;
+    } else if (!powerDown) {
+      powerSleepArmed = false;
+    }
+    powerWasDown = powerDown;
+  }
+
+  if (powerSleepArmed && gpio.getPowerButtonHeldTime() > SETTINGS.getPowerButtonDuration()) {
     // If the screenshot combination is potentially being pressed, don't sleep
     if (gpio.isPressed(HalGPIO::BTN_DOWN)) {
       return;
     }
+    // The only user-visible acknowledgment can be seconds away (a wake paint in
+    // flight must finish before the sleep screen renders), so log the trigger
+    // itself for field diagnosis of "my sleep press was ignored" reports.
+    LOG_INF("MAIN", "Power hold-to-sleep triggered (held %lu ms)", gpio.getPowerButtonHeldTime());
     enterDeepSleep();
     // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
     return;
