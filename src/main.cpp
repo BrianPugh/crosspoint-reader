@@ -19,6 +19,7 @@
 
 #include <cstring>
 
+#include "BootProfiler.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "KOReaderCredentialStore.h"
@@ -194,6 +195,10 @@ static bool loadSleepFrameBuffer() {
 // Enter deep sleep mode
 void enterDeepSleep(bool fromTimeout = false) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
+  // Sleep-entry timing: the power button is dead from here until
+  // startDeepSleep() releases the battery latch (nothing polls it in between),
+  // so these marks measure the user-perceived "can't wake yet" window.
+  BOOT_MARK("sleep: enter");
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
 
   const bool isQuickResumeSleep =
@@ -203,14 +208,17 @@ void enterDeepSleep(bool fromTimeout = false) {
   APP_STATE.showBootScreen = !isQuickResumeSleep;
 
   APP_STATE.saveToFile();
+  BOOT_MARK("sleep: state saved");
 
   // Commit to sleeping before goToSleep() runs the outgoing activity's onExit():
   // a WiFi activity would otherwise silentRestart() here and reboot instead.
   deepSleepInProgress = true;
   activityManager.goToSleep(fromTimeout);
+  BOOT_MARK("sleep: sleep screen done (activity exit + art pipeline)");
 
   if (isQuickResumeSleep) {
     saveSleepFrameBuffer();
+    BOOT_MARK("sleep: frame buffer saved (48 KB)");
   }
 
   // Tear down WiFi so the modem power domain isn't held alive across deep sleep.
@@ -222,7 +230,14 @@ void enterDeepSleep(bool fromTimeout = false) {
 
   halTiltSensor.deepSleep();
   display.deepSleep();
+  BOOT_MARK("sleep: peripherals down, releasing battery latch");
   LOG_DBG("MAIN", "Entering deep sleep");
+#if BOOT_PROFILE
+  // Serial output emitted <500 ms before the latch releases is lost before the
+  // host drains it (see docs/boot-sleep-optimization.md methodology); hold the
+  // port open long enough to capture the marks above. Profiling builds only.
+  delay(500);
+#endif
 
   powerManager.startDeepSleep(gpio);
 }
@@ -232,6 +247,7 @@ void setupDisplayAndFonts(bool seamless = false) {
   renderer.begin();
   activityManager.begin();
   LOG_DBG("MAIN", "Display initialized");
+  BOOT_MARK("display init");
 
   // Initialize font decompressor for compressed reader fonts
   if (!fontDecompressor.init()) {
@@ -253,9 +269,11 @@ void setupDisplayAndFonts(bool seamless = false) {
   renderer.insertFont(UI_10_FONT_ID, ui10FontFamily);
   renderer.insertFont(UI_12_FONT_ID, ui12FontFamily);
   renderer.insertFont(SMALL_FONT_ID, smallFontFamily);
+  BOOT_MARK("builtin fonts");
 
   // Discover and load SD card fonts
   sdFontSystem.begin(renderer);
+  BOOT_MARK("sd card fonts");
 
   LOG_DBG("MAIN", "Fonts setup");
 }
@@ -278,6 +296,10 @@ void setup() {
 #endif
 #endif
 
+  // Cumulative time here = pre-setup startup (bootloader + app init, invisible
+  // to millis()-based marks) + the 250 ms serial settle above on dev builds.
+  BOOT_MARK("setup entry (after serial settle)");
+
   HalSystem::begin();
 
   // Read-and-clear so a panic later in setup() doesn't loop into silent reboot.
@@ -293,18 +315,44 @@ void setup() {
   halTiltSensor.begin();
   halClock.begin();
 
+  // First of two USB samples (second below, before display bring-up): the SOF
+  // verdict needs two samples a frame apart, and it must be settled before the
+  // first refresh — the boot paint's light-sleep slices would otherwise kill a
+  // live CDC link whenever the charge-based check reads false (full battery,
+  // data-only cable). See HalGPIO::pollUsbState().
+  gpio.pollUsbState();
+
+#if !BOOT_PROFILE
+  // Light-sleep through the render task's e-ink BUSY wait (0.3-2 s of pure pin
+  // polling) in short slices, waking exactly on the BUSY pin's completion level
+  // (falls back to plain polling when WiFi/USB blocks light sleep)
+  display.setBusyWaitSliceHook(
+      [](int8_t busyPin, uint8_t busyLevel) { return powerManager.onEinkBusyWaitSlice(busyPin, busyLevel); });
+#else
+  // Profiling builds skip the busy-wait hooks entirely: the hooks' USB guard is
+  // isUsbConnectedCached(), which on the X3 reads charge current and can't see
+  // a data-only/non-charging monitor cable — so the 10 MHz downclock + sliced
+  // light sleep would engage during every refresh and freeze USB-CDC, dropping
+  // exactly the end-of-wake logs we're here to capture. Refresh timing itself
+  // is unaffected (the wait is panel-bound), but don't use this env for power
+  // measurements.
+#endif
+
   LOG_INF("MAIN", "Hardware detect: %s", gpio.deviceIsX3() ? "X3" : "X4");
+  BOOT_MARK("hal init (gpio/power/tilt/clock)");
 
   // SD Card Initialization
   // We need 6 open files concurrently when parsing a new chapter
   if (!Storage.begin()) {
     LOG_ERR("MAIN", "SD card initialization failed");
+    gpio.pollUsbState();  // settle the USB verdict before the error paint (see above)
     setupDisplayAndFonts(isSilentReboot);
     activityManager.goToFullScreenMessage("SD card error", EpdFontFamily::BOLD);
     return;
   }
 
   HalSystem::checkPanic();
+  BOOT_MARK("sd mount");
 
   SETTINGS.loadFromFile();
   APP_STATE.loadFromFile();
@@ -314,6 +362,7 @@ void setup() {
   OPDS_STORE.loadFromFile();
   UITheme::getInstance().reload();
   ButtonNavigator::setMappedInputManager(mappedInputManager);
+  BOOT_MARK("settings + stores load");
 
   const auto wakeupReason = gpio.getWakeupReason();
   switch (wakeupReason) {
@@ -335,6 +384,8 @@ void setup() {
     default:
       break;
   }
+  // Power-button wakes: includes the user's configured hold-to-wake duration
+  BOOT_MARK("wake verify (power button hold)");
 
   // Recovery firmware mode: hold left side button (BTN_UP) together with the power button at
   // boot to skip directly to the SD-card firmware update screen. Useful on devices where USB
@@ -354,6 +405,8 @@ void setup() {
       LOG_INF("MAIN", "Recovery firmware mode (UP + POWER held at boot)");
     }
   }
+  // Fixed 500 ms settle window on every power-button wake (recovery-combo check)
+  BOOT_MARK("recovery-combo settle");
 
   // First serial output only here to avoid timing inconsistencies for power button press duration verification
   LOG_DBG("MAIN", "Starting CrossPoint version " CROSSPOINT_VERSION);
@@ -366,6 +419,10 @@ void setup() {
                             : !APP_STATE.showBootScreen ? BootResume::QuickResume
                                                         : BootResume::Splash;
   bool allowFastInitialReaderRefresh = false;
+
+  // Second USB sample (first one right after powerManager.begin()): settles the
+  // SOF host-link verdict before the first refresh can slice-sleep.
+  gpio.pollUsbState();
 
   setupDisplayAndFonts(resume != BootResume::Splash);
 
@@ -404,6 +461,10 @@ void setup() {
       activityManager.goToBoot();
       break;
   }
+  // Splash path: BootActivity::onEnter ran synchronously above, so this delta
+  // is the splash draw + its full-refresh chain. Quick-resume: frame restore +
+  // half refresh.
+  BOOT_MARK("boot screen painted");
 
   if (recoveryFirmwareMode) {
     // Skip normal home/reader routing: jump straight into the SD firmware picker.
@@ -433,6 +494,9 @@ void setup() {
     APP_STATE.saveToFile();
     activityManager.goToReader(path, allowFastInitialReaderRefresh);
   }
+  // Routing only queues the target activity; its onEnter runs in the first
+  // activityManager.loop() and is timed by the ActivityManager marks.
+  BOOT_MARK("target activity routed");
 
   if (resume == BootResume::Silent) {
     // Block until the first paint physically completes. refreshDisplay()
@@ -453,7 +517,20 @@ void setup() {
 
   // Ensure we're not still holding the power button before leaving setup
   waitForPowerRelease();
+  // User-dependent: setup() blocks here until the power button is released,
+  // which delays the reader's onEnter/first paint (they run in loop()).
+  BOOT_MARK("power button released, setup done");
   allowSleepAt = millis() + 2000;
+}
+
+// delay() counts ticks, and the tick stops while onEinkBusyWaitSlice() light-sleeps
+// the chip (millis() is RTC-corrected on wake; the tick is not). A delay(10) mid-refresh
+// would stretch to ~210 ms and starve button sampling. millis() stays honest.
+static void delayWallClock(const unsigned long ms) {
+  const unsigned long deadline = millis() + ms;
+  while (static_cast<long>(millis() - deadline) < 0) {
+    vTaskDelay(1);
+  }
 }
 
 void loop() {
@@ -480,6 +557,7 @@ void loop() {
     if (line.startsWith("CMD:")) {
       String cmd = line.substring(4);
       cmd.trim();
+      bool handled = true;
       if (cmd == "SCREENSHOT") {
         const uint32_t bufferSize = display.getBufferSize();
         logSerial.printf("SCREENSHOT_START:%d\n", bufferSize);
@@ -487,6 +565,28 @@ void loop() {
         logSerial.write(buf, bufferSize);
         logSerial.printf("SCREENSHOT_END\n");
       }
+#if BOOT_PROFILE
+      // Repeatable wake captures: CMD:SLEEP runs the real sleep path (lock
+      // screen render + deep sleep), then a power-button press produces a true
+      // instrumented wake. CMD:REBOOT is a warm restart — note it skips the
+      // power-button verify + recovery-settle phases, so it is NOT
+      // representative of a wake-from-lock-screen timeline.
+      else if (cmd == "SLEEP") {
+        LOG_INF("BOOT", "SLEEP command received, entering deep sleep");
+        enterDeepSleep();
+      } else if (cmd == "REBOOT") {
+        LOG_INF("BOOT", "REBOOT command received");
+        delay(50);  // let the log line flush before the port dies
+        ESP.restart();
+      }
+#endif
+      else {
+        handled = false;
+      }
+      // Raw print, not LOG_*: debugging_monitor.py keys on this ack to report
+      // command success, so it must survive LOG_LEVEL=0 builds. Commands
+      // compiled out of this build report unknown.
+      logSerial.printf(handled ? "CMDACK:%s\n" : "CMDERR:unknown:%s\n", cmd.c_str());
     }
   }
 
@@ -561,6 +661,9 @@ void loop() {
   activityManager.loop();
   const unsigned long activityDuration = millis() - activityStartTime;
 
+  // Body complete: releases the slice hook's yield (see onEinkBusyWaitSlice).
+  powerManager.noteMainLoopIteration();
+
   const unsigned long loopDuration = millis() - loopStartTime;
   if (loopDuration > maxLoopDuration) {
     maxLoopDuration = loopDuration;
@@ -576,13 +679,52 @@ void loop() {
     powerManager.setPowerSaving(false);  // Make sure we're at full performance when skipLoopDelay is requested
     yield();                             // Give FreeRTOS a chance to run tasks, but return immediately
   } else {
-    if (millis() - lastActivityTime >= HalPowerManager::IDLE_POWER_SAVING_MS) {
-      // If we've been inactive for a while, increase the delay to save power
-      powerManager.setPowerSaving(true);  // Lower CPU frequency after extended inactivity
-      delay(50);
+    const unsigned long idleMs = millis() - lastActivityTime;
+    if (idleMs >= HalPowerManager::IDLE_LIGHT_SLEEP_MS) {
+      // Idle: light-sleep between input polls instead of busy-delaying (same poll cadence).
+      // Race-to-sleep: run the brief wake windows at normal clock, not LOW_POWER_FREQ.
+      // The board's sleep-floor current is paid per-millisecond regardless of CPU
+      // speed, so finishing the per-wake work ~16x faster and returning to sleep
+      // costs less charge than stretching the window at 10 MHz (measured at 10 MHz:
+      // 8.8 mA for 4.5 ms per wake). The downclock below only serves the pre-sleep
+      // 100 Hz delay-poll phase. The lightSleep()-rejected fallback delay() then
+      // also runs at normal clock, but that only happens when USB (externally
+      // powered), WiFi, or a render Lock (full speed wanted anyway) is active.
+      powerManager.setPowerSaving(false);
+#if BOOT_PROFILE
+      // Profiling builds never light-sleep: the X3 can't detect a non-charging
+      // USB cable, and light sleep freezes USB-CDC — dropping serial logs and
+      // CMD: input (see docs/boot-sleep-optimization.md methodology notes).
+      constexpr bool allowLightSleep = false;
+#else
+      constexpr bool allowLightSleep = true;
+#endif
+      if (gpio.isDebouncePending()) {
+        // A raw button-state change is mid-debounce: commitment needs a second
+        // matching sample, so poll again quickly instead of sleeping a slice —
+        // a tap shorter than the 50 ms cadence would otherwise land in a single
+        // sample and be dropped, and every press would commit a slice late.
+        delayWallClock(10);
+      } else if (!allowLightSleep || !powerManager.lightSleep(gpio)) {
+        // Light sleep declined = a render Lock, USB, or WiFi is active — the
+        // chip is at full clock anyway, so poll at 100 Hz. A 50 ms cadence
+        // here dropped sub-slice power taps (a press needs two samples >=5 ms
+        // apart to commit), which made short-press sleep flaky during renders
+        // — exactly when a render Lock forces this fallback.
+        delayWallClock(10);
+      }
     } else {
-      // Short delay to prevent tight loop while still being responsive
-      delay(10);
+      // Response window after recent input: keep 100 Hz polling for snappy interaction,
+      // but downclock once rapid-input bursts have settled — renders re-raise the clock
+      // via HalPowerManager::Lock, so full speed only serves loop bookkeeping here
+      if (idleMs >= HalPowerManager::IDLE_DOWNCLOCK_MS) {
+#if !BOOT_PROFILE
+        // Same X3 cable-detect blind spot as the light-sleep gate above:
+        // 10 MHz breaks USB-CDC, so profiling builds stay at full clock.
+        powerManager.setPowerSaving(true);
+#endif
+      }
+      delayWallClock(10);
     }
   }
 }

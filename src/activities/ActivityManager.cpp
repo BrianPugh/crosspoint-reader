@@ -5,6 +5,7 @@
 
 #include <algorithm>
 
+#include "BootProfiler.h"
 #include "OpdsServerStore.h"
 #include "boot_sleep/BootActivity.h"
 #include "boot_sleep/SleepActivity.h"
@@ -50,7 +51,17 @@ void ActivityManager::renderTaskLoop() {
     RenderLock lock;
     if (currentActivity) {
       HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
+#if BOOT_PROFILE
+      // Copy the name before render(): render consumes the lock, after which
+      // the main task may delete currentActivity out from under us.
+      char profiledName[32];
+      snprintf(profiledName, sizeof(profiledName), "%s", currentActivity->name.c_str());
+      const unsigned long renderStart = millis();
+#endif
       currentActivity->render(std::move(lock));
+#if BOOT_PROFILE
+      LOG_INF("BOOT", "render '%s' took %lu ms", profiledName, millis() - renderStart);
+#endif
     }
     // Notify any task blocked in requestUpdateAndWait() that the render is done.
     TaskHandle_t waiter = nullptr;
@@ -146,7 +157,13 @@ void ActivityManager::loop() {
       currentActivity = std::move(pendingActivity);
 
       lock.unlock();  // onEnter may acquire its own lock
+#if BOOT_PROFILE
+      const unsigned long enterStart = millis();
+#endif
       currentActivity->onEnter();
+#if BOOT_PROFILE
+      LOG_INF("BOOT", "onEnter '%s' took %lu ms", currentActivity->name.c_str(), millis() - enterStart);
+#endif
 
       // onEnter may request another pending action, we will handle it in the next loop iteration
       continue;
@@ -180,7 +197,13 @@ void ActivityManager::replaceActivity(std::unique_ptr<Activity>&& newActivity) {
   } else {
     // No current activity, safe to launch immediately
     currentActivity = std::move(newActivity);
+#if BOOT_PROFILE
+    const unsigned long enterStart = millis();
+#endif
     currentActivity->onEnter();
+#if BOOT_PROFILE
+    LOG_INF("BOOT", "onEnter '%s' took %lu ms", currentActivity->name.c_str(), millis() - enterStart);
+#endif
   }
 }
 
@@ -318,7 +341,11 @@ void ActivityManager::requestUpdateAndWait() {
   assert(!holdingRenderLock && "Cannot call requestUpdateAndWait() while holding RenderLock");
 
   xTaskNotify(renderTaskHandle, 1, eIncrement);
+  // Tell the power manager the loop is parked here: it cannot poll input until the
+  // render finishes, so the BUSY-wait slice hook should not yield to it meanwhile.
+  powerManager.noteRenderWaitBegin();
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  powerManager.noteRenderWaitEnd();
 }
 
 // RenderLock
