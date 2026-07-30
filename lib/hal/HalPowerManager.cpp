@@ -66,6 +66,21 @@ void HalPowerManager::setPowerSaving(bool enabled) {
 }
 
 void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
+  // A latched press means the user wants the device back — reboot into the
+  // normal wake path instead of powering off. Sleep state was already saved,
+  // so the boot resumes exactly like a real wake.
+  //
+  // This runs *before* the release wait rather than after it: the wait lives
+  // inside the SDK's deepSleepUntilPowerButton() below, which never returns,
+  // so there is no post-wait point left to consume the latch at. A press that
+  // starts after this check is instead handled by that SDK wait — it holds off
+  // sleep until the button is released, then arms it as the wake source.
+  if (gpio.consumePowerWakeLatch() != 0) {
+    LOG_INF("PWR", "Power press during sleep entry; waking instead of sleeping");
+    delay(50);  // let the log line flush
+    ESP.restart();
+  }
+
 #ifdef ENABLE_SERIAL_LOG
   // Tear down HWCDC so the host sees a clean disconnect and the peripheral
   // doesn't hold power domains that interfere with USB-powered GPIO wake.

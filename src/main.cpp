@@ -163,9 +163,18 @@ void silentRestartToReader() {
 
 void waitForPowerRelease() {
   gpio.update();
+  const unsigned long start = millis();
+  unsigned long lastLog = start;
   while (gpio.isPressed(HalGPIO::BTN_POWER)) {
     delay(50);
     gpio.update();
+    // A stuck-pressed misread here parks the boot at the retained lockscreen
+    // forever with the device fully awake; make that state field-diagnosable.
+    if (millis() - lastLog >= 1000) {
+      lastLog = millis();
+      LOG_DBG("MAIN", "Still waiting for power release at boot (%lu ms, held=%lu ms)", millis() - start,
+              gpio.getPowerButtonHeldTime());
+    }
   }
 }
 
@@ -199,6 +208,10 @@ void enterDeepSleep(bool fromTimeout = false) {
   // startDeepSleep() releases the battery latch (nothing polls it in between),
   // so these marks measure the user-perceived "can't wake yet" window.
   BOOT_MARK("sleep: enter");
+  // Nothing polls input from here until the power actually cuts (up to several
+  // seconds with uncached sleep art), so latch power presses via ISR — a
+  // swallowed press means the user waits out the entry, then has to press again.
+  gpio.armPowerWakeLatch();
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
 
   const bool isQuickResumeSleep =
@@ -231,6 +244,7 @@ void enterDeepSleep(bool fromTimeout = false) {
   halTiltSensor.deepSleep();
   display.deepSleep();
   BOOT_MARK("sleep: peripherals down, releasing battery latch");
+
   LOG_DBG("MAIN", "Entering deep sleep");
 #if BOOT_PROFILE
   // Serial output emitted <500 ms before the latch releases is lost before the
@@ -239,6 +253,8 @@ void enterDeepSleep(bool fromTimeout = false) {
   delay(500);
 #endif
 
+  // startDeepSleep() consumes the wake latch after its button-release wait, so
+  // a press landing anywhere up to that point reboots into the wake path.
   powerManager.startDeepSleep(gpio);
 }
 
@@ -279,6 +295,11 @@ void setupDisplayAndFonts(bool seamless = false) {
 }
 
 void setup() {
+  // First statement on purpose: a wake during the post-poweroff capacitor-decay
+  // window boots with the battery latch still pad-held LOW — every instruction
+  // before this line runs on borrowed power that dies when the user releases
+  // the button. holdPowerRails() releases the stale hold and re-asserts the
+  // profile's latch pins (GPIO13 on X3/X4).
   BoardConfig::holdPowerRails();
 
   t1 = millis();

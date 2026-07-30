@@ -1,3 +1,4 @@
+#include <BoardConfig.h>
 #include <HalGPIO.h>
 #include <Logging.h>
 #include <PowerManager.h>
@@ -5,6 +6,7 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <XteinkDetect.h>
+#include <driver/gpio.h>
 #include <esp_sleep.h>
 #include <soc/usb_serial_jtag_struct.h>
 
@@ -267,6 +269,104 @@ bool HalGPIO::verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPre
   }
   return true;
 }
+
+// Compile-time kill switch for the power-wake latch, for debug builds that
+// must run without any GPIO ISR service installed. Costs the sleep-entry
+// wake latch (presses during sleep entry are swallowed); never ship with 0.
+#ifndef POWER_WAKE_LATCH
+#define POWER_WAKE_LATCH 1
+#endif
+
+namespace {
+// Power-wake latch state. Written by the ISR, read by the task after
+// detaching; single 32-bit-aligned loads/stores are atomic on this core.
+// Non-const statics live in DRAM, as IRAM_ATTR code requires.
+volatile uint32_t powerLatchPressMs = 0;           // millis() of the last pressed edge
+volatile uint32_t powerLatchLongestContactMs = 0;  // longest completed press since arming
+int8_t powerLatchPin = -1;
+bool powerLatchActiveHigh = false;
+
+constexpr uint32_t POWER_LATCH_MIN_CONTACT_MS = 30;
+
+void IRAM_ATTR powerWakeLatchIsr(void*) {
+  const bool pressed = (gpio_get_level(static_cast<gpio_num_t>(powerLatchPin)) != 0) == powerLatchActiveHigh;
+  const uint32_t now = millis();
+  if (pressed) {
+    powerLatchPressMs = now;
+  } else if (powerLatchPressMs != 0) {
+    // A full press->release. Requiring the pressed edge to have been seen by
+    // THIS ISR ignores the release of the gesture that opened the latch window
+    // (its pressed edge predates the arm), and the contact-time floor ignores
+    // its release bounce. The longest contact is kept (not the last) so a
+    // qualifying hold isn't shadowed by trailing bounce blips.
+    const uint32_t contact = now - powerLatchPressMs;
+    if (contact >= POWER_LATCH_MIN_CONTACT_MS && contact > powerLatchLongestContactMs) {
+      powerLatchLongestContactMs = contact;
+    }
+  }
+}
+}  // namespace
+
+void HalGPIO::armPowerWakeLatch() {
+#if !POWER_WAKE_LATCH
+  return;  // debug build: no latch, no GPIO ISR service (see knob above)
+#endif
+  powerLatchPin = BoardConfig::ACTIVE.input.power;
+  powerLatchActiveHigh = BoardConfig::ACTIVE.input.powerActiveHigh;
+  if (powerLatchPin < 0) {
+    return;
+  }
+  powerLatchPressMs = 0;
+  powerLatchLongestContactMs = 0;
+  // Raw IDF ISR lifecycle, NOT Arduino attachInterrupt(): consume uninstalls
+  // the GPIO ISR service, because its CPU interrupt must not exist outside
+  // the latch window. Combined with a light-sleep level-type wake interrupt
+  // left armed on a pin, an asserted level feeding the shared service with no
+  // per-pin handler registered re-enters the ISR forever and livelocks the
+  // CPU. Arduino cannot survive that uninstall:
+  // its core tracks the install in a never-reset function-local static
+  // (esp32-hal-gpio.c, interrupt_initialized), so a later attachInterrupt()
+  // would skip the reinstall and this ISR would silently never fire again.
+  // Flag 0 = same service config Arduino used here before. A press edge
+  // landing while flash cache is suspended (SPIFFS/NVS write) is held in the
+  // GPIO status register and serviced late, not lost.
+  const auto pin = static_cast<gpio_num_t>(powerLatchPin);
+  const esp_err_t err = gpio_install_isr_service(0);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    LOG_ERR("GPIO", "Wake latch ISR service install failed: %d", static_cast<int>(err));
+    powerLatchPin = -1;
+    return;
+  }
+  gpio_set_intr_type(pin, GPIO_INTR_ANYEDGE);
+  gpio_isr_handler_add(pin, powerWakeLatchIsr, nullptr);
+}
+
+uint32_t HalGPIO::consumePowerWakeLatch() {
+  if (powerLatchPin < 0) {
+    return 0;
+  }
+  const auto pin = static_cast<gpio_num_t>(powerLatchPin);
+  gpio_isr_handler_remove(pin);
+  gpio_set_intr_type(pin, GPIO_INTR_DISABLE);
+  // Free the service's CPU interrupt entirely (safe: this latch is the only
+  // ISR-service user in the firmware). Light-sleep paths must decline while
+  // the latch is armed (isPowerWakeLatchArmed), so the service and any
+  // light-sleep level wakes never coexist.
+  gpio_uninstall_isr_service();
+  uint32_t longestContactMs = powerLatchLongestContactMs;
+  // Also count a press that is still held right now (pressed edge latched,
+  // no release yet, contact time already past the bounce floor).
+  if (powerLatchPressMs != 0 && (gpio_get_level(static_cast<gpio_num_t>(powerLatchPin)) != 0) == powerLatchActiveHigh) {
+    const uint32_t contact = millis() - powerLatchPressMs;
+    if (contact >= POWER_LATCH_MIN_CONTACT_MS && contact > longestContactMs) {
+      longestContactMs = contact;
+    }
+  }
+  powerLatchPin = -1;
+  return longestContactMs;
+}
+
+bool HalGPIO::isPowerWakeLatchArmed() const { return powerLatchPin >= 0; }
 
 bool HalGPIO::isUsbConnected() const {
   // Recent SOF activity means an enumerated host regardless of what the
