@@ -429,6 +429,14 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
       for (int glyphY = 0; glyphY < height; glyphY++) {
         const int outerCoord = outerBase + glyphY;
         for (int glyphX = 0; glyphX < width; glyphX++, pixelPosition++) {
+          // Whole-byte skip: a zero source byte is four white pixels — nothing
+          // to draw in any render mode (white is skipped everywhere below).
+          if ((pixelPosition & 3) == 0 && glyphX + 4 <= width && bitmap[pixelPosition >> 2] == 0) {
+            glyphX += 3;
+            pixelPosition += 3;
+            continue;
+          }
+
           int screenX, screenY;
           if constexpr (rotation == TextRotation::Rotated90CW) {
             screenX = outerCoord;
@@ -448,6 +456,9 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
           if (renderMode == GfxRenderer::BW && bmpVal < 3) {
             // Black (also paints over the grays in BW mode)
             renderer.drawPixel(screenX, screenY, pixelState);
+          } else if (renderMode == GfxRenderer::GRAYSCALE_BOTH && (bmpVal == 1 || bmpVal == 2)) {
+            // Single-pass dual-plane: one geometry computation marks both planes
+            renderer.drawGrayPixel(screenX, screenY, bmpVal);
           } else if (renderMode == GfxRenderer::GRAYSCALE_MSB && (bmpVal == 1 || bmpVal == 2)) {
             // Light gray (also mark the MSB if it's going to be a dark gray too)
             // Dedicated X3 gray LUTs now provide proper 4-level gray on both devices
@@ -464,6 +475,13 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
       for (int glyphY = 0; glyphY < height; glyphY++) {
         const int outerCoord = outerBase + glyphY;
         for (int glyphX = 0; glyphX < width; glyphX++, pixelPosition++) {
+          // Whole-byte skip: a zero source byte is eight blank pixels.
+          if ((pixelPosition & 7) == 0 && glyphX + 8 <= width && bitmap[pixelPosition >> 3] == 0) {
+            glyphX += 7;
+            pixelPosition += 7;
+            continue;
+          }
+
           int screenX, screenY;
           if constexpr (rotation == TextRotation::Rotated90CW) {
             screenX = outerCoord;
@@ -520,6 +538,34 @@ void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
     target[byteIndex] &= ~(1 << bitPosition);  // Clear bit
   } else {
     target[byteIndex] |= 1 << bitPosition;  // Set bit
+  }
+}
+
+// Hot per-pixel path for GRAYSCALE_BOTH strip passes (see drawPixel note above).
+// Both planes share the same byte/bit geometry, so rotation, band clip, and
+// addressing are computed once for the pair of writes.
+void GfxRenderer::drawGrayPixel(const int x, const int y, const uint8_t grayVal) const {
+  if (_stripBufMsb == nullptr) {
+    return;  // GRAYSCALE_BOTH is only valid inside a dual strip target
+  }
+
+  int phyX = 0;
+  int phyY = 0;
+  rotateCoordinates(orientation, x, y, &phyX, &phyY, panelWidth, panelHeight);
+
+  // Single unsigned band test covers out-of-frame and off-band rows; unlike
+  // drawPixel there is no LOG_ERR — off-band pixels are the normal strip clip.
+  const int rowY = phyY - _stripY0;
+  if (phyX < 0 || phyX >= panelWidth || static_cast<unsigned>(rowY) >= static_cast<unsigned>(_stripRows)) {
+    return;
+  }
+
+  const uint32_t byteIndex = static_cast<uint32_t>(rowY) * panelWidthBytes + (phyX / 8);
+  const uint8_t mask = 1 << (7 - (phyX % 8));
+
+  _stripBufMsb[byteIndex] |= mask;  // MSB plane: light and dark gray
+  if (grayVal == 1) {
+    _stripBuf[byteIndex] |= mask;  // LSB plane: dark gray only
   }
 }
 
@@ -1491,8 +1537,11 @@ static unsigned long start_ms = 0;
 void GfxRenderer::clearScreen(const uint8_t color) const {
   start_ms = millis();
   if (_stripActive) {
-    // Clear only the active band's scratch, not the shared framebuffer.
+    // Clear only the active band's scratch(es), not the shared framebuffer.
     memset(_stripBuf, color, static_cast<size_t>(panelWidthBytes) * _stripRows);
+    if (_stripBufMsb != nullptr) {
+      memset(_stripBufMsb, color, static_cast<size_t>(panelWidthBytes) * _stripRows);
+    }
     return;
   }
   display.clearScreen(color);
@@ -1509,9 +1558,16 @@ void GfxRenderer::beginStripTarget(uint8_t* scratch, int stripY0, int stripRows)
   _stripActive = true;
 }
 
+void GfxRenderer::beginDualStripTarget(uint8_t* lsbScratch, uint8_t* msbScratch, int stripY0, int stripRows) const {
+  assert(msbScratch != nullptr);
+  beginStripTarget(lsbScratch, stripY0, stripRows);
+  _stripBufMsb = msbScratch;
+}
+
 void GfxRenderer::endStripTarget() const {
   _stripActive = false;
   _stripBuf = nullptr;
+  _stripBufMsb = nullptr;
   _stripY0 = 0;
   _stripRows = 0;
 }

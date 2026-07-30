@@ -1596,6 +1596,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     const int gh = renderer.getDisplayHeight();
     const int gwBytes = renderer.getDisplayWidthBytes();
     const size_t planeBytes = static_cast<size_t>(gwBytes) * gh;
+    const size_t stripBytes = static_cast<size_t>(gwBytes) * STRIP_ROWS;
 
     // Render one plane band-by-band into a whole-plane buffer without touching
     // the controller, so it can run while the refresh is still in flight.
@@ -1604,6 +1605,24 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       for (int y = 0; y < gh; y += STRIP_ROWS) {
         const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
         renderer.beginStripTarget(buf + static_cast<size_t>(y) * gwBytes, y, rows);
+        renderer.clearScreen(0x00);
+        renderGrayscalePass();
+        renderer.endStripTarget();
+      }
+    };
+
+    // Dual-plane variant of the above: each strip renders ONCE in
+    // GRAYSCALE_BOTH, filling both plane buffers per pixel — halves the page
+    // re-renders (and their per-word text pipeline overhead). Only the glyph
+    // text path understands GRAYSCALE_BOTH; the image drawers
+    // (DirectPixelWriter, drawBitmap*) only handle single-plane modes, so
+    // callers must gate on a text-only page.
+    auto renderBothPlanesToBuffers = [&](uint8_t* lsbBuf, uint8_t* msbBuf) {
+      renderer.setRenderMode(GfxRenderer::GRAYSCALE_BOTH);
+      for (int y = 0; y < gh; y += STRIP_ROWS) {
+        const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
+        const size_t off = static_cast<size_t>(y) * gwBytes;
+        renderer.beginDualStripTarget(lsbBuf + off, msbBuf + off, y, rows);
         renderer.clearScreen(0x00);
         renderGrayscalePass();
         renderer.endStripTarget();
@@ -1634,8 +1653,14 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     auto msbPlaneBuf = (lsbPlaneBuf && planeBufFits()) ? makeUniqueNoThrow<uint8_t[]>(planeBytes) : nullptr;
 
     if (lsbPlaneBuf) {
-      renderPlaneToBuffer(true, lsbPlaneBuf.get());
-      if (msbPlaneBuf) renderPlaneToBuffer(false, msbPlaneBuf.get());
+      if (msbPlaneBuf) {
+        // Both planes resident: one dual-plane pass instead of two. This tier is
+        // text-only by construction (overlapRefresh implies !pageHasImages), so
+        // GRAYSCALE_BOTH is always eligible here.
+        renderBothPlanesToBuffers(lsbPlaneBuf.get(), msbPlaneBuf.get());
+      } else {
+        renderPlaneToBuffer(true, lsbPlaneBuf.get());
+      }
       const auto tGrayRender = millis();
 
       renderer.waitRefreshComplete();
@@ -1668,7 +1693,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       // Per-strip scratch tier: blocking panels (X3) and the OOM fallback.
       // The strip writes below need the panel idle, so wait out any pending
       // async refresh first (no-op on blocking panels).
-      auto scratch = makeUniqueNoThrow<uint8_t[]>(static_cast<size_t>(gwBytes) * STRIP_ROWS);
+      auto scratch = makeUniqueNoThrow<uint8_t[]>(stripBytes);
       renderer.waitRefreshComplete();
       if (!scratch) {
         LOG_ERR("ERS", "OOM: grayscale strip scratch (%d bytes); skipping AA this page", gwBytes * STRIP_ROWS);
@@ -1680,30 +1705,58 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
           renderer.cleanupGrayscaleWithFrameBuffer();
         }
       } else {
-        // Bands may be streamed in any order: X4 windows each via setRamArea,
-        // X3 via PTL.
-        renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
-        for (int y = 0; y < gh; y += STRIP_ROWS) {
-          const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
-          renderer.beginStripTarget(scratch.get(), y, rows);
-          renderer.clearScreen(0x00);
-          renderGrayscalePass();
-          renderer.endStripTarget();
-          renderer.writeGrayscalePlaneStrip(true, scratch.get(), y, rows);
+        // Dual-plane fast path for text-only pages, same trick as the buffered
+        // tier but one strip at a time. The second scratch is a pure
+        // accelerator: if it fails to allocate we silently fall back to
+        // two-pass, so no LOG_ERR here.
+        std::unique_ptr<uint8_t[]> scratchMsb;
+        if (needsTextGrayscale && !pageHasImages) {
+          scratchMsb = makeUniqueNoThrow<uint8_t[]>(stripBytes);
         }
-        const auto tGrayLsb = millis();
 
-        // MSB plane.
-        renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
-        for (int y = 0; y < gh; y += STRIP_ROWS) {
-          const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
-          renderer.beginStripTarget(scratch.get(), y, rows);
-          renderer.clearScreen(0x00);
-          renderGrayscalePass();
-          renderer.endStripTarget();
-          renderer.writeGrayscalePlaneStrip(false, scratch.get(), y, rows);
+        unsigned long tGrayLsb, tGrayMsb;
+        if (scratchMsb) {
+          // Bands may be streamed in any order: X4 windows each via setRamArea,
+          // X3 via PTL.
+          renderer.setRenderMode(GfxRenderer::GRAYSCALE_BOTH);
+          for (int y = 0; y < gh; y += STRIP_ROWS) {
+            const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
+            renderer.beginDualStripTarget(scratch.get(), scratchMsb.get(), y, rows);
+            renderer.clearScreen(0x00);
+            renderGrayscalePass();
+            renderer.endStripTarget();
+            renderer.writeGrayscalePlaneStrip(true, scratch.get(), y, rows);
+            renderer.writeGrayscalePlaneStrip(false, scratchMsb.get(), y, rows);
+          }
+          // Combined pass: gray_lsb logs the whole dual pass, gray_msb logs 0.
+          tGrayLsb = millis();
+          tGrayMsb = tGrayLsb;
+        } else {
+          // Bands may be streamed in any order: X4 windows each via setRamArea,
+          // X3 via PTL.
+          renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+          for (int y = 0; y < gh; y += STRIP_ROWS) {
+            const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
+            renderer.beginStripTarget(scratch.get(), y, rows);
+            renderer.clearScreen(0x00);
+            renderGrayscalePass();
+            renderer.endStripTarget();
+            renderer.writeGrayscalePlaneStrip(true, scratch.get(), y, rows);
+          }
+          tGrayLsb = millis();
+
+          // MSB plane.
+          renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+          for (int y = 0; y < gh; y += STRIP_ROWS) {
+            const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
+            renderer.beginStripTarget(scratch.get(), y, rows);
+            renderer.clearScreen(0x00);
+            renderGrayscalePass();
+            renderer.endStripTarget();
+            renderer.writeGrayscalePlaneStrip(false, scratch.get(), y, rows);
+          }
+          tGrayMsb = millis();
         }
-        const auto tGrayMsb = millis();
 
         renderer.setRenderMode(GfxRenderer::BW);
         renderer.displayGrayBuffer();

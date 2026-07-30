@@ -27,7 +27,11 @@ enum Color : uint8_t { Clear = 0x00, White = 0x01, LightGray = 0x05, DarkGray = 
 
 class GfxRenderer {
  public:
-  enum RenderMode { BW, GRAYSCALE_LSB, GRAYSCALE_MSB };
+  // GRAYSCALE_BOTH renders LSB and MSB planes in a single pass via a dual strip
+  // target (see beginDualStripTarget); only the glyph text path supports it —
+  // image drawers (DirectPixelWriter, drawBitmap*) understand single-plane
+  // modes only, so callers must use it on text-only content.
+  enum RenderMode { BW, GRAYSCALE_LSB, GRAYSCALE_MSB, GRAYSCALE_BOTH };
 
   // Logical screen orientation from the perspective of callers
   enum Orientation {
@@ -74,6 +78,10 @@ class GfxRenderer {
   mutable int _stripY0 = 0;
   mutable int _stripRows = 0;
   mutable bool _stripActive = false;
+  // Second scratch for GRAYSCALE_BOTH dual-plane passes: _stripBuf holds the
+  // LSB plane, _stripBufMsb the MSB plane. Non-null only inside a dual strip
+  // target; drawGrayPixel() writes both planes from one geometry computation.
+  mutable uint8_t* _stripBufMsb = nullptr;
 
   // CJK UI font fallback map: primary (built-in, Latin-only) UI font id -> a
   // size-matched SD-card font id that carries CJK glyphs. When a string drawn
@@ -191,6 +199,12 @@ class GfxRenderer {
   void beginStripTarget(uint8_t* scratch, int stripY0, int stripRows) const;
   void endStripTarget() const;
 
+  // Dual-plane variant for GRAYSCALE_BOTH: renders one strip pass that fills
+  // both plane scratches (each panelWidthBytes * stripRows bytes). drawPixel()
+  // and clearScreen() treat lsbScratch as the primary target; drawGrayPixel()
+  // marks both. Ended by the same endStripTarget().
+  void beginDualStripTarget(uint8_t* lsbScratch, uint8_t* msbScratch, int stripY0, int stripRows) const;
+
   // Band culling for tiled grayscale. Takes a glyph bounding box in logical
   // screen coords and returns false only when a strip is active AND the box's
   // physical y-extent lies entirely outside the active band, letting callers
@@ -209,6 +223,10 @@ class GfxRenderer {
 
   // Drawing
   void drawPixel(int x, int y, bool state = true) const;
+  // Dual-plane grayscale write (GRAYSCALE_BOTH only): marks the MSB plane for
+  // grayVal 1 or 2 and additionally the LSB plane for grayVal 1, computing the
+  // rotation/byte geometry once for both. No-op outside a dual strip target.
+  void drawGrayPixel(int x, int y, uint8_t grayVal) const;
   void drawLine(int x1, int y1, int x2, int y2, bool state = true) const;
   void drawLine(int x1, int y1, int x2, int y2, int lineWidth, bool state) const;
   void drawArc(int maxRadius, int cx, int cy, int xDir, int yDir, int lineWidth, bool state) const;
