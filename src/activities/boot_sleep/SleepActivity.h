@@ -1,4 +1,5 @@
 #pragma once
+#include "SleepArtCache.h"
 #include "activities/Activity.h"
 
 class Bitmap;
@@ -10,12 +11,19 @@ class SleepActivity final : public Activity {
   void onEnter() override;
 
  private:
+  // Paints the "Going to sleep" popup (once) before a slow render path: a
+  // cache-miss art render or cover generation. Fast paths skip it — their own
+  // single refresh lands sooner than the popup used to, and the popup's
+  // full-frame refresh would otherwise be ~27% of a cache-hit sleep entry.
+  void paintGoingToSleepPopupOnce() const;
   void renderDefaultSleepScreen() const;
   void renderCustomSleepScreen() const;
   void renderCoverSleepScreen() const;
-  void renderBitmapSleepScreen(const Bitmap& bitmap) const;
+  // cacheKey non-null persists the rendered planes for later cache-hit sleeps.
+  void renderBitmapSleepScreen(const Bitmap& bitmap, const SleepArtCache::Key* cacheKey = nullptr) const;
   void renderLastScreenSleepScreen() const;
   void renderBlankSleepScreen() const;
 
   bool fromTimeout = false;
+  mutable bool sleepPopupPainted = false;
 };

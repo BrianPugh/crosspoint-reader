@@ -30,16 +30,6 @@ void SleepActivity::onEnter() {
     return renderLastScreenSleepScreen();
   }
 
-  // Show popup with reader orientation only when going to sleep from reader
-  if (APP_STATE.lastSleepFromReader) {
-    ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
-    GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
-    renderer.setOrientation(GfxRenderer::Orientation::Portrait);
-  } else {
-    GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
-  }
-  BOOT_MARK("sleep art: 'going to sleep' popup painted");
-
   switch (SETTINGS.sleepScreen) {
     case (CrossPointSettings::SLEEP_SCREEN_MODE::BLANK):
       return renderBlankSleepScreen();
@@ -58,6 +48,21 @@ void SleepActivity::onEnter() {
   }
 }
 
+void SleepActivity::paintGoingToSleepPopupOnce() const {
+  if (sleepPopupPainted) {
+    return;
+  }
+  sleepPopupPainted = true;
+  // Show popup with reader orientation only when going to sleep from reader
+  if (APP_STATE.lastSleepFromReader) {
+    ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
+    GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
+    renderer.setOrientation(GfxRenderer::Orientation::Portrait);
+  } else {
+    GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
+  }
+}
+
 void SleepActivity::renderCustomSleepScreen() const {
   // Check if we have a /.sleep (preferred) or /sleep directory
   const char* sleepDir = nullptr;
@@ -68,10 +73,17 @@ void SleepActivity::renderCustomSleepScreen() const {
   // This takes priority over the /sleep folder.
   HalFile file;
   if (Storage.openFileForRead("SLP", "/sleep.bmp", file)) {
+    const auto cacheKey = SleepArtCache::keyFor(file, "/sleep.bmp");
+    if (SleepArtCache::tryRender(renderer, cacheKey)) {
+      file.close();
+      if (dir) dir.close();
+      return;
+    }
+    paintGoingToSleepPopupOnce();  // cache miss: the full render is slow
     Bitmap bitmap(file, true);
     if (bitmap.parseHeaders() == BmpReaderError::Ok) {
       LOG_DBG("SLP", "Loading: /sleep.bmp");
-      renderBitmapSleepScreen(bitmap);
+      renderBitmapSleepScreen(bitmap, &cacheKey);
       file.close();
       if (dir) dir.close();
       return;
@@ -138,10 +150,17 @@ void SleepActivity::renderCustomSleepScreen() const {
       HalFile randFile;
       if (Storage.openFileForRead("SLP", filename, randFile)) {
         LOG_DBG("SLP", "Randomly loading: %s/%s", sleepDir, files[randomFileIndex].c_str());
+        const auto cacheKey = SleepArtCache::keyFor(randFile, filename);
+        if (SleepArtCache::tryRender(renderer, cacheKey)) {
+          randFile.close();
+          dir.close();
+          return;
+        }
+        paintGoingToSleepPopupOnce();  // cache miss: the full render is slow
         delay(100);
         Bitmap bitmap(randFile, true);
         if (bitmap.parseHeaders() == BmpReaderError::Ok) {
-          renderBitmapSleepScreen(bitmap);
+          renderBitmapSleepScreen(bitmap, &cacheKey);
           randFile.close();
           dir.close();
           return;
@@ -176,7 +195,7 @@ void SleepActivity::renderDefaultSleepScreen() const {
   renderer.displayBuffer(HalDisplay::HALF_REFRESH);
 }
 
-void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap) const {
+void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap, const SleepArtCache::Key* cacheKey) const {
   int x, y;
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
@@ -222,6 +241,13 @@ void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap) const {
   const bool hasGreyscale = bitmap.hasGreyscale() &&
                             SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::NO_FILTER;
 
+  // Persist each finished plane so later sleeps with this image can skip the
+  // per-plane source decodes entirely (see SleepArtCache).
+  SleepArtCache::Writer cacheWriter;
+  if (cacheKey) {
+    cacheWriter.begin(renderer, *cacheKey, hasGreyscale ? 3 : 1);
+  }
+
   renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, cropX, cropY);
   BOOT_MARK("sleep art: BW plane drawn (SD stream + scale)");
 
@@ -239,6 +265,8 @@ void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap) const {
     renderer.displayBuffer(HalDisplay::HALF_REFRESH);
   }
   BOOT_MARK("sleep art: base refresh done");
+  // Store after the refresh so the art appears as early as it does uncached.
+  cacheWriter.storePlane(renderer);
 
   if (hasGreyscale) {
     bitmap.rewindToData();
@@ -248,6 +276,7 @@ void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap) const {
     BOOT_MARK("sleep art: gray LSB plane drawn (SD stream + scale)");
     renderer.copyGrayscaleLsbBuffers();
     BOOT_MARK("sleep art: gray LSB copied to controller");
+    cacheWriter.storePlane(renderer);
 
     bitmap.rewindToData();
     renderer.clearScreen(0x00);
@@ -256,11 +285,13 @@ void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap) const {
     BOOT_MARK("sleep art: gray MSB plane drawn (SD stream + scale)");
     renderer.copyGrayscaleMsbBuffers();
     BOOT_MARK("sleep art: gray MSB copied to controller");
+    cacheWriter.storePlane(renderer);
 
     renderer.displayGrayBuffer();
     BOOT_MARK("sleep art: gray nudge refresh done");
     renderer.setRenderMode(GfxRenderer::BW);
   }
+  cacheWriter.commit();
 }
 
 void SleepActivity::renderCoverSleepScreen() const {
@@ -280,6 +311,10 @@ void SleepActivity::renderCoverSleepScreen() const {
 
   std::string coverBmpPath;
   bool cropped = SETTINGS.sleepScreenCoverMode == CrossPointSettings::SLEEP_SCREEN_COVER_MODE::CROP;
+
+  // Cover generation below can take seconds on a cold cache, so covers keep
+  // the up-front popup (no refresh saving here, unlike cached custom art).
+  paintGoingToSleepPopupOnce();
 
   // Check if the current book is XTC, TXT, or EPUB
   if (FsHelpers::hasXtcExtension(APP_STATE.openEpubPath)) {
@@ -331,10 +366,14 @@ void SleepActivity::renderCoverSleepScreen() const {
 
   HalFile file;
   if (Storage.openFileForRead("SLP", coverBmpPath, file)) {
+    const auto cacheKey = SleepArtCache::keyFor(file, coverBmpPath);
+    if (SleepArtCache::tryRender(renderer, cacheKey)) {
+      return;
+    }
     Bitmap bitmap(file);
     if (bitmap.parseHeaders() == BmpReaderError::Ok) {
       LOG_DBG("SLP", "Rendering sleep cover: %s", coverBmpPath.c_str());
-      renderBitmapSleepScreen(bitmap);
+      renderBitmapSleepScreen(bitmap, &cacheKey);
       return;
     }
   }
