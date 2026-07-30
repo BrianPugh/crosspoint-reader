@@ -52,6 +52,13 @@ class HalDisplay {
   bool supportsAsyncRefresh() const;
   void refreshDisplay(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
 
+  // Promote the next displayBuffer()/refreshDisplay() to FULL_REFRESH,
+  // regardless of the mode the caller passes. Used on splash-skipped wake when
+  // the panel holds a static sleep screen: the first content paint must be a
+  // full refresh or the sleep image ghosts through. One-shot, device-independent
+  // (unlike the X3-only driver resync).
+  void promoteNextRefreshToFull() { promoteNextToFull = true; }
+
   // Power management
   void deepSleep();
 
@@ -104,6 +111,9 @@ class HalDisplay {
 
  private:
   EInkDisplay einkDisplay;
+  bool promoteNextToFull = false;
+
+  RefreshMode applyPromotion(RefreshMode mode);
 };
 
 extern HalDisplay display;

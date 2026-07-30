@@ -218,9 +218,17 @@ void enterDeepSleep(bool fromTimeout = false) {
       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
       (fromTimeout &&
        SETTINGS.quickResumeSleepScreen == CrossPointSettings::QUICK_RESUME_SLEEP_SCREEN::QUICK_RESUME_AFTER_TIMEOUT);
-  APP_STATE.showBootScreen = !isQuickResumeSleep;
+  const bool skipSplashOnWake = isQuickResumeSleep || SETTINGS.skipSplashOnWake != 0;
+  APP_STATE.showBootScreen = !skipSplashOnWake;
+  // A static sleep screen left on the panel needs a FULL first content paint on
+  // wake; a quick-resume frame matches the content and can take the fast path.
+  APP_STATE.sleepWakeNeedsFullRefresh = skipSplashOnWake && !isQuickResumeSleep;
 
-  APP_STATE.saveToFile();
+  if (!APP_STATE.saveToFile()) {
+    // Wake reads these flags from SD; if this write failed the next wake
+    // falls back to the splash (one-shot arm design, self-heals next sleep).
+    LOG_ERR("MAIN", "Failed to persist sleep state; next wake will show the splash");
+  }
   BOOT_MARK("sleep: state saved");
 
   // Commit to sleeping before goToSleep() runs the outgoing activity's onExit():
@@ -229,6 +237,10 @@ void enterDeepSleep(bool fromTimeout = false) {
   activityManager.goToSleep(fromTimeout);
   BOOT_MARK("sleep: sleep screen done (activity exit + art pipeline)");
 
+  // Only quick-resume sleeps save the frame: the wake path restores it for the
+  // cheap overlay + HALF resume. Static-art skip-splash wakes never read it
+  // (their first content paint is promoted to FULL, which doesn't diff against
+  // the old frame), so skip the 48 KB SD write.
   if (isQuickResumeSleep) {
     saveSleepFrameBuffer();
     BOOT_MARK("sleep: frame buffer saved (48 KB)");
@@ -439,6 +451,13 @@ void setup() {
   const BootResume resume = isSilentReboot              ? BootResume::Silent
                             : !APP_STATE.showBootScreen ? BootResume::QuickResume
                                                         : BootResume::Splash;
+  // Splash on a perceived wake is always one of these inputs: showBootScreen=1
+  // means the previous session never completed enterDeepSleep() (flash, plain
+  // reboot, panic, brownout, or the sleep-time state write failed).
+  LOG_DBG("MAIN", "Boot resume=%d (reset=%d wake=%d showBootScreen=%d needsFull=%d silent=%d)",
+          static_cast<int>(resume), static_cast<int>(esp_reset_reason()), static_cast<int>(wakeupReason),
+          static_cast<int>(APP_STATE.showBootScreen), static_cast<int>(APP_STATE.sleepWakeNeedsFullRefresh),
+          static_cast<int>(isSilentReboot));
   bool allowFastInitialReaderRefresh = false;
 
   // Second USB sample (first one right after powerManager.begin()): settles the
@@ -452,13 +471,28 @@ void setup() {
       // Splash skipped: the routing block below picks the target activity; the
       // panel keeps showing the pre-reboot popup until that first paint lands.
       break;
-    case BootResume::QuickResume:
-      // One-shot flag: re-arm the splash for the next non-quick-resume boot. Save
+    case BootResume::QuickResume: {
+      // One-shot flags: re-arm the splash for the next non-quick-resume boot. Save
       // before any painting so a hang in the blocking paint path can't strand
       // us in a quick-resume-with-no-frame loop on the next boot.
+      const bool needsFullRefresh = APP_STATE.sleepWakeNeedsFullRefresh;
       APP_STATE.showBootScreen = true;
+      APP_STATE.sleepWakeNeedsFullRefresh = false;
       APP_STATE.saveToFile();
-      if (loadSleepFrameBuffer()) {
+      if (needsFullRefresh) {
+        // The panel retains a static sleep screen that doesn't match the target
+        // content, so the first content paint must be FULL regardless. Pay zero
+        // refreshes here: no frame restore (a FULL paint never diffs against the
+        // old frame) and no loading-icon overlay — the panel is powered off
+        // after deep sleep, and the X3 driver promotes any first post-sleep
+        // refresh to the full waveform chain, so an icon swap costs ~2.4 s
+        // (measured 2026-07-09), more than the splash it replaces. The retained
+        // art itself is the wake feedback until the content lands in one chain.
+        Storage.remove(SLEEP_FRAME_FILE);  // not saved on this path; clear any stale file
+        display.promoteNextRefreshToFull();
+      } else if (loadSleepFrameBuffer()) {
+        // True quick resume: the retained frame matches the target content, so
+        // a cheap overlay + differential refresh gives immediate feedback.
         const bool useDifferentialRefresh = gpio.deviceIsX3();
         if (useDifferentialRefresh) {
           // begin() clears the X3 controller RAM, so restore the saved frame as
@@ -478,6 +512,7 @@ void setup() {
         activityManager.goToBoot();  // frame file missing, fall back to the splash
       }
       break;
+    }
     case BootResume::Splash:
       activityManager.goToBoot();
       break;

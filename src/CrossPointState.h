@@ -20,6 +20,11 @@ class CrossPointState : public PersistableStore<CrossPointState> {
   uint8_t readerActivityLoadCount = 0;
   bool lastSleepFromReader = false;
   bool showBootScreen = true;
+  // Set when the saved sleep frame is a static sleep screen (not the pre-sleep
+  // content), so the first content paint after wake must be a FULL refresh to
+  // avoid ghosting. False for quick-resume sleeps, where the frame matches the
+  // content about to be painted.
+  bool sleepWakeNeedsFullRefresh = false;
 
   static const char* getFilePath() { return "/.crosspoint/state.json"; }
   void toJson(JsonDocument& doc) const;
