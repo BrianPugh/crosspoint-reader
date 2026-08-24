@@ -5,8 +5,10 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <WiFi.h>
+#include <esp_mac.h>
 
 #include <algorithm>
+#include <cstring>
 
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
@@ -14,6 +16,15 @@
 #include "activities/util/KeyboardEntryActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+
+// Read the factory STA MAC directly from eFuse. Unlike WiFi.macAddress(), this
+// does not depend on the STA netif existing or the WiFi driver having started,
+// so it never races with WIFI_EVENT_STA_START and never returns 00:00:00:00:00:00.
+static void readStaMac(uint8_t mac[6]) {
+  if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
+    memset(mac, 0, 6);
+  }
+}
 
 void WifiSelectionActivity::onEnter() {
   Activity::onEnter();
@@ -44,7 +55,7 @@ void WifiSelectionActivity::onEnter() {
 
   // Cache MAC address for display
   uint8_t mac[6];
-  WiFi.macAddress(mac);
+  readStaMac(mac);
   char macStr[64];
   snprintf(macStr, sizeof(macStr), "%s %02x-%02x-%02x-%02x-%02x-%02x", tr(STR_MAC_ADDRESS), mac[0], mac[1], mac[2],
            mac[3], mac[4], mac[5]);
@@ -359,11 +370,14 @@ void WifiSelectionActivity::attemptConnection() {
   WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
   WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
 
-  // Set hostname so routers show "CrossPoint-Reader-AABBCCDDEEFF" instead of "esp32-XXXXXXXXXXXX"
-  String mac = WiFi.macAddress();
-  mac.replace(":", "");
-  String hostname = "CrossPoint-Reader-" + mac;
-  WiFi.setHostname(hostname.c_str());
+  // Set hostname so routers show "CrossPoint-Reader-AABBCCDDEEFF" instead of "esp32-XXXXXXXXXXXX".
+  // Read from eFuse (not WiFi.macAddress()) to avoid the STA_START race that yields 000000000000.
+  uint8_t macBytes[6];
+  readStaMac(macBytes);
+  char hostname[40];
+  snprintf(hostname, sizeof(hostname), "CrossPoint-Reader-%02X%02X%02X%02X%02X%02X", macBytes[0], macBytes[1],
+           macBytes[2], macBytes[3], macBytes[4], macBytes[5]);
+  WiFi.setHostname(hostname);
 
   if (selectedRequiresPassword && !enteredPassword.empty()) {
     WiFi.begin(selectedSSID.c_str(), enteredPassword.c_str());
